@@ -1,0 +1,20 @@
+name: Transcription
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-transcription:
+    runs-on: macos-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run transcription
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          source test.sh example.m4a
+        timeout-minutes: 300
+
