@@ -64,6 +64,7 @@ merged_file="$odir/$basename_noext.merged.json"
 echo "=== Merging RO + EN segments ==="
 python$VER - "$ro_file" "$en_file" "$merged_file" << 'PYEOF'
 import json, sys, re
+from difflib import SequenceMatcher
 
 ro_file, en_file, out_file = sys.argv[1], sys.argv[2], sys.argv[3]
 
@@ -86,12 +87,6 @@ ro_segs = get_segments(ro_data)
 en_segs = get_segments(en_data)
 
 # --- Heuristics for picking the language of each segment ---
-# 1) avg_logprob: higher (closer to 0) = more confident
-# 2) no_speech_prob: lower = more likely real speech
-# 3) compression_ratio: lower = less repetitive/hallucinated
-# 4) length: shorter text on the "wrong" language usually means garbage
-# 5) language markers: quick regex heuristics as tiebreakers
-
 RO_DIACRITICS = re.compile(r"[ăâîșțĂÂÎȘȚ]")
 RO_WORDS = re.compile(
     r"\b(și|sau|dar|este|sunt|care|pentru|acest|această|foarte|"
@@ -112,17 +107,14 @@ def score(seg, expected_lang):
     if not text:
         return -1e9
 
-    # Base: confidence metrics from Whisper
     avg_logprob = seg.get("avg_logprob", seg.get("avg_logprob", -1.0))
     no_speech = seg.get("no_speech_prob", 0.0)
     comp_ratio = seg.get("compression_ratio", 1.0)
 
-    # Convert to a positive score
-    s = avg_logprob * 1.0          # logprob typically negative; higher = better
-    s -= no_speech * 2.0           # penalize segments likely non-speech
-    s -= max(0.0, comp_ratio - 2.4) * 0.5  # penalize repetitiveness
+    s = avg_logprob * 1.0
+    s -= no_speech * 2.0
+    s -= max(0.0, comp_ratio - 2.4) * 0.5
 
-    # Language heuristics
     ro_hits = len(RO_DIACRITICS.findall(text)) + len(RO_WORDS.findall(text))
     en_hits = len(EN_WORDS.findall(text))
 
@@ -133,7 +125,6 @@ def score(seg, expected_lang):
         s += en_hits * 0.3
         s -= ro_hits * 0.15
 
-    # Very short segments are unreliable; dampen their influence
     if len(text.split()) <= 2:
         s *= 0.5
 
@@ -144,7 +135,6 @@ def find_overlap(seg, candidates, tol=0.5):
     best = None
     best_score = -1
     for c in candidates:
-        # Time overlap
         ov_start = max(seg.get("start", 0), c.get("start", 0))
         ov_end = min(seg.get("end", 0), c.get("end", 0))
         overlap = max(0.0, ov_end - ov_start)
@@ -152,7 +142,6 @@ def find_overlap(seg, candidates, tol=0.5):
             best_score = overlap
             best = c
     if best is None and candidates:
-        # Fall back to nearest start
         best = min(candidates, key=lambda c: abs(c.get("start", 0) - seg.get("start", 0)))
         if abs(best.get("start", 0) - seg.get("start", 0)) > tol:
             best = None
@@ -204,6 +193,81 @@ for en_seg in en_segs:
     })
 
 merged.sort(key=lambda s: (s.get("start") or 0))
+
+# --- Deduplicate near-identical English segments ---
+# If 90%+ of two or more English segments are essentially the same sentence,
+# discard all occurrences except the LAST one.
+
+def normalize_text(t):
+    """Lowercase, strip punctuation, collapse whitespace for comparison."""
+    t = (t or "").lower()
+    t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def similarity(a, b):
+    """Return similarity ratio (0..1) between two normalized strings."""
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+SIM_THRESHOLD = 0.90
+
+# Compute indices of English segments only
+en_indices = [i for i, s in enumerate(merged) if s.get("lang") == "en"]
+
+# Union-Find to group near-duplicate English segments
+parent = {i: i for i in en_indices}
+
+def find(x):
+    while parent[x] != x:
+        parent[x] = parent[parent[x]]
+        x = parent[x]
+    return x
+
+def union(a, b):
+    ra, rb = find(a), find(b)
+    if ra != rb:
+        parent[rb] = ra
+
+# Precompute normalized texts
+norm = {i: normalize_text(merged[i].get("text")) for i in en_indices}
+
+for a_pos in range(len(en_indices)):
+    ia = en_indices[a_pos]
+    na = norm[ia]
+    if not na:
+        continue
+    for b_pos in range(a_pos + 1, len(en_indices)):
+        ib = en_indices[b_pos]
+        nb = norm[ib]
+        if not nb:
+            continue
+        # Quick length filter: skip obviously different lengths
+        la, lb = len(na), len(nb)
+        if min(la, lb) / max(la, lb) < SIM_THRESHOLD:
+            continue
+        if similarity(na, nb) >= SIM_THRESHOLD:
+            union(ia, ib)
+
+# Group by root
+groups = {}
+for i in en_indices:
+    r = find(i)
+    groups.setdefault(r, []).append(i)
+
+# Determine which indices to drop: within each group with >1 member, keep only the last.
+drop_indices = set()
+for r, members in groups.items():
+    if len(members) > 1:
+        members_sorted = sorted(members, key=lambda i: (merged[i].get("start") or 0))
+        # Keep only the last occurrence
+        for i in members_sorted[:-1]:
+            drop_indices.add(i)
+
+if drop_indices:
+    merged = [s for i, s in enumerate(merged) if i not in drop_indices]
+    print(f"Deduplicated {len(drop_indices)} near-identical English segment(s).")
 
 # Simple turn-based concatenation for convenience
 def merge_adjacent(segs):
