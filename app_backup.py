@@ -5,7 +5,6 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from difflib import SequenceMatcher
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, render_template_string
 
@@ -19,9 +18,6 @@ MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 IVRIT = "ivrit-ai/pyannote-speaker-diarization-3.1"
 ALTPYA = "pyannote/speaker-diarization-2.1"
 PYA = "pyannote/speaker-diarization-community-1"
-
-# Similarity threshold for considering two English segments "essentially the same sentence"
-SIM_THRESHOLD = float(os.environ.get("DEDUP_SIM_THRESHOLD", "0.90"))
 
 RO_DIR = TRANSCRIPTIONS_DIR / "ro"
 EN_DIR = TRANSCRIPTIONS_DIR / "en"
@@ -112,84 +108,6 @@ def merge_adjacent(segs):
     return out
 
 
-def _normalize_text(t):
-    """Lowercase, strip punctuation, collapse whitespace for comparison."""
-    t = (t or "").lower()
-    t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-def _similarity(a, b):
-    """Return similarity ratio (0..1) between two normalized strings."""
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a, b).ratio()
-
-
-def dedupe_english_segments(merged, threshold=SIM_THRESHOLD):
-    """
-    If 90%+ of two or more English segments (consecutive or not) are
-    essentially the same sentence, discard all occurrences except the LAST one.
-
-    Returns (new_merged, num_dropped).
-    """
-    en_indices = [i for i, s in enumerate(merged) if s.get("lang") == "en"]
-    if len(en_indices) < 2:
-        return merged, 0
-
-    norm = {i: _normalize_text(merged[i].get("text")) for i in en_indices}
-
-    # Union-Find
-    parent = {i: i for i in en_indices}
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    for a_pos in range(len(en_indices)):
-        ia = en_indices[a_pos]
-        na = norm[ia]
-        if not na:
-            continue
-        for b_pos in range(a_pos + 1, len(en_indices)):
-            ib = en_indices[b_pos]
-            nb = norm[ib]
-            if not nb:
-                continue
-            la, lb = len(na), len(nb)
-            if min(la, lb) / max(la, lb) < threshold:
-                continue
-            if _similarity(na, nb) >= threshold:
-                union(ia, ib)
-
-    groups = {}
-    for i in en_indices:
-        r = find(i)
-        groups.setdefault(r, []).append(i)
-
-    drop_indices = set()
-    for _r, members in groups.items():
-        if len(members) > 1:
-            members_sorted = sorted(members, key=lambda i: (merged[i].get("start") or 0))
-            # Keep only the last occurrence
-            for i in members_sorted[:-1]:
-                drop_indices.add(i)
-
-    if not drop_indices:
-        return merged, 0
-
-    new_merged = [s for i, s in enumerate(merged) if i not in drop_indices]
-    return new_merged, len(drop_indices)
-
-
 def merge_transcriptions(ro_data, en_data, source_file):
     ro_segs = get_segments(ro_data)
     en_segs = get_segments(en_data)
@@ -239,17 +157,11 @@ def merge_transcriptions(ro_data, en_data, source_file):
 
     merged.sort(key=lambda s: (s.get("start") or 0))
 
-    # --- Deduplicate near-identical English segments ---
-    merged, dropped = dedupe_english_segments(merged)
-    if dropped:
-        print(f"Deduplicated {dropped} near-identical English segment(s).")
-
     return {
         "source_file": source_file,
         "segments": merged,
         "turns": merge_adjacent(merged),
         "full_text": " ".join(s["text"] for s in merged if s["text"]),
-        "deduped_count": dropped,
     }
 
 
@@ -318,8 +230,7 @@ INDEX_HTML = """
         const r = await fetch('/transcribe', { method: 'POST', body: fd });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-        status.textContent = 'Done. Merged file: ' + j.merged_file +
-          (j.deduped_count ? ' (deduped ' + j.deduped_count + ' EN segment(s))' : '');
+        status.textContent = 'Done. Merged file: ' + j.merged_file;
         result.textContent = JSON.stringify(j.result, null, 2);
         result.style.display = 'block';
       } catch (err) {
@@ -345,7 +256,6 @@ def health():
         "device": DEVICE,
         "model": MODEL,
         "transcriptions_dir": str(TRANSCRIPTIONS_DIR),
-        "dedup_sim_threshold": SIM_THRESHOLD,
     })
 
 
@@ -394,7 +304,6 @@ def transcribe():
             "en_file": str(en_file),
             "merged_file": str(merged_file),
             "segment_count": len(result["segments"]),
-            "deduped_count": result.get("deduped_count", 0),
             "result": result,
         })
 
