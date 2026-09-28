@@ -338,50 +338,259 @@ INDEX_HTML = """
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Transcription Service</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 780px; margin: 2rem auto; padding: 0 1rem; }
-    input[type=file] { margin: 1rem 0; }
-    button { padding: 0.6rem 1.2rem; font-size: 1rem; cursor: pointer; }
-    pre { background: #f4f4f4; padding: 1rem; overflow: auto; max-height: 60vh; }
-    .status { margin-top: 1rem; color: #444; }
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #172334;
+      background: #f3f6fb;
+      font-synthesis: none;
+      text-rendering: optimizeLegibility;
+      -webkit-font-smoothing: antialiased;
+      --muted: #68778b;
+      --line: #e1e8f1;
+      --blue: #315be8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      padding: 52px 20px 72px;
+      background:
+        radial-gradient(ellipse at 50% -10%, rgba(94, 132, 255, .17), transparent 42%),
+        #f3f6fb;
+    }
+    main { width: min(100%, 760px); margin: 0 auto; }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 30px 2px;
+      color: #53647b;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .brand-mark {
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border-radius: 11px;
+      background: #315be8;
+      color: white;
+      font-size: 16px;
+      letter-spacing: 0;
+      box-shadow: 0 5px 14px rgba(49, 91, 232, .24);
+    }
+    .card {
+      overflow: hidden;
+      border: 1px solid rgba(221, 229, 240, .9);
+      border-radius: 22px;
+      background: #fff;
+      box-shadow: 0 18px 55px rgba(29, 48, 82, .09);
+    }
+    .intro { padding: 42px 46px 32px; }
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: .11em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 0;
+      color: #142238;
+      font-size: clamp(30px, 5vw, 42px);
+      letter-spacing: -.045em;
+      line-height: 1.12;
+    }
+    .description {
+      max-width: 570px;
+      margin: 15px 0 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.7;
+    }
+    form {
+      display: grid;
+      gap: 24px;
+      padding: 30px 46px 38px;
+      border-top: 1px solid #edf1f6;
+      background: #fcfdff;
+    }
+    .field { display: grid; gap: 9px; }
+    label, .field-label {
+      color: #26364b;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .hint { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    input[type=file], select {
+      width: 100%;
+      min-height: 48px;
+      border: 1px solid #d7e0ec;
+      border-radius: 10px;
+      background: #fff;
+      color: #25364d;
+      font: inherit;
+    }
+    input[type=file] { padding: 7px; color: var(--muted); font-size: 13px; }
+    input[type=file]::file-selector-button {
+      margin-right: 12px;
+      padding: 9px 13px;
+      border: 0;
+      border-radius: 7px;
+      background: #edf2ff;
+      color: #315be8;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    select { padding: 0 13px; }
+    input:focus-visible, select:focus-visible, button:focus-visible {
+      outline: 3px solid rgba(49, 91, 232, .25);
+      outline-offset: 2px;
+    }
+    button {
+      display: inline-flex;
+      min-height: 49px;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      padding: 0 20px;
+      border: 0;
+      border-radius: 10px;
+      background: var(--blue);
+      color: #fff;
+      font: inherit;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 6px 14px rgba(49, 91, 232, .2);
+      transition: background .15s ease, transform .15s ease, box-shadow .15s ease;
+    }
+    button:hover { transform: translateY(-1px); background: #244bd0; box-shadow: 0 9px 18px rgba(49, 91, 232, .25); }
+    button:disabled { cursor: wait; opacity: .72; transform: none; }
+    .button-icon { font-size: 17px; line-height: 1; }
+    .status {
+      display: none;
+      margin: 20px 0 0;
+      padding: 14px 17px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: #fff;
+      color: #46566c;
+      font-size: 13px;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }
+    .status.visible { display: block; }
+    .status[data-state="error"] { border-color: #f3d0d0; background: #fff8f8; color: #a13232; }
+    .status[data-state="success"] { border-color: #ccebd9; background: #f5fcf7; color: #236741; }
+    .result-wrap {
+      margin-top: 18px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+      box-shadow: 0 8px 24px rgba(29, 48, 82, .05);
+    }
+    .result-heading {
+      margin: 0;
+      padding: 15px 19px;
+      border-bottom: 1px solid #edf1f6;
+      color: #26364b;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    pre {
+      margin: 0;
+      padding: 20px;
+      overflow: auto;
+      max-height: 60vh;
+      color: #31445f;
+      background: #fbfcfe;
+      font: 12px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .footnote { margin: 17px 3px 0; color: #8491a3; font-size: 12px; text-align: center; }
+    @media (max-width: 560px) {
+      body { padding: 25px 14px 40px; }
+      .brand { margin-bottom: 19px; }
+      .intro { padding: 30px 24px 24px; }
+      form { gap: 21px; padding: 24px; }
+      button { width: 100%; }
+    }
   </style>
 </head>
 <body>
-  <h1>Audio → Bilingual Transcript</h1>
-  <p>Runs the selected backend twice (Romanian + English) and merges the results. Speaker diarization is available with whispermlx.</p>
-  <form id="f">
-    <input type="file" name="audio" accept="audio/*,.m4a" required>
-    <br>
-    <label for="backend">Transcription backend:</label>
-    <select name="backend" id="backend">
-      <option value="whispermlx" {% if default_backend == "whispermlx" %}selected{% endif %}>whispermlx (speaker diarization)</option>
-      <option value="faster-whisper" {% if default_backend == "faster-whisper" %}selected{% endif %}>Faster Whisper (no speaker diarization)</option>
-    </select>
-    <br>
-    <button type="submit">Transcribe</button>
-  </form>
-  <div class="status" id="status"></div>
-  <pre id="result" style="display:none"></pre>
+  <main>
+    <div class="brand"><span class="brand-mark" aria-hidden="true">V</span> Vorbix transcription</div>
+    <section class="card" aria-labelledby="page-title">
+      <div class="intro">
+        <p class="eyebrow">Audio to text</p>
+        <h1 id="page-title">Bilingual transcription,<br>made simple.</h1>
+        <p class="description">Get a single Romanian and English transcript from your audio. Vorbix compares both language passes and combines the clearest segments.</p>
+      </div>
+      <form id="f">
+        <div class="field">
+          <label for="audio">Choose an audio file</label>
+          <input type="file" id="audio" name="audio" accept="audio/*,.m4a" required>
+          <span class="hint">Select an audio recording to transcribe.</span>
+        </div>
+        <div class="field">
+          <label for="backend">Transcription engine</label>
+          <select name="backend" id="backend">
+            <option value="whispermlx" {% if default_backend == "whispermlx" %}selected{% endif %}>Whisper MLX — includes speaker diarization</option>
+            <option value="faster-whisper" {% if default_backend == "faster-whisper" %}selected{% endif %}>Faster Whisper — no speaker diarization</option>
+          </select>
+          <span class="hint">Whisper MLX requires an HF_TOKEN configured on the server.</span>
+        </div>
+        <button type="submit" id="submit-button"><span class="button-icon" aria-hidden="true">↗</span><span>Transcribe audio</span></button>
+      </form>
+    </section>
+    <div class="status" id="status" role="status" aria-live="polite"></div>
+    <section class="result-wrap" id="result-wrap" aria-label="Transcription result" hidden>
+      <h2 class="result-heading">Merged transcript · JSON</h2>
+      <pre id="result"></pre>
+    </section>
+    <p class="footnote">Processing runs on the server and may take a few minutes.</p>
+  </main>
   <script>
     const f = document.getElementById('f');
+    const button = document.getElementById('submit-button');
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
       const status = document.getElementById('status');
       const result = document.getElementById('result');
-      result.style.display = 'none';
-      status.textContent = 'Uploading & transcribing… (this can take a while)';
+      const resultWrap = document.getElementById('result-wrap');
+      resultWrap.hidden = true;
+      status.className = 'status visible';
+      status.dataset.state = 'working';
+      status.textContent = 'Uploading audio and transcribing both language passes. This may take a few minutes…';
+      button.disabled = true;
       const fd = new FormData(f);
       try {
         const r = await fetch('/transcribe', { method: 'POST', body: fd });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-        status.textContent = 'Done with ' + j.backend + '. Merged file: ' + j.merged_file +
-          (j.deduped_count ? ' (deduped ' + j.deduped_count + ' EN segment(s))' : '');
+        status.dataset.state = 'success';
+        status.textContent = 'Transcription complete with ' + j.backend + '. ' + j.segment_count +
+          ' segments saved to ' + j.merged_file +
+          (j.deduped_count ? ' (' + j.deduped_count + ' repeated English segments removed).' : '.');
         result.textContent = JSON.stringify(j.result, null, 2);
-        result.style.display = 'block';
+        resultWrap.hidden = false;
       } catch (err) {
+        status.dataset.state = 'error';
         status.textContent = 'Error: ' + err.message;
+      } finally {
+        button.disabled = false;
       }
     });
   </script>
