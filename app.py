@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from functools import lru_cache
 from difflib import SequenceMatcher
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, render_template_string
@@ -16,6 +17,10 @@ DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 TRANSCRIPTIONS_DIR = Path(os.environ.get("TRANSCRIPTIONS_DIR", Path.home() / "transcriptions"))
 MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
+DEFAULT_BACKEND = os.environ.get("WHISPER_BACKEND", "whispermlx").strip().lower()
+BACKENDS = ("whispermlx", "faster-whisper")
+if DEFAULT_BACKEND not in BACKENDS:
+    raise ValueError(f"WHISPER_BACKEND must be one of: {', '.join(BACKENDS)}")
 IVRIT = "ivrit-ai/pyannote-speaker-diarization-3.1"
 ALTPYA = "pyannote/speaker-diarization-2.1"
 PYA = "pyannote/speaker-diarization-community-1"
@@ -254,7 +259,54 @@ def merge_transcriptions(ro_data, en_data, source_file):
 
 
 # ---- Whisper invocation ----
-def run_whisper(audio_path, output_dir, language):
+@lru_cache(maxsize=2)
+def get_faster_whisper_model(model_name, device):
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "Faster Whisper is not installed. Install the faster-whisper dependency."
+        ) from exc
+    return WhisperModel(model_name, device=device, compute_type="default")
+
+
+def faster_whisper_transcribe(audio_path, output_dir, language):
+    model = get_faster_whisper_model(MODEL, DEVICE)
+    segments, info = model.transcribe(
+        str(audio_path),
+        language=language,
+        beam_size=5,
+        condition_on_previous_text=False,
+        compression_ratio_threshold=2.4,
+        log_prob_threshold=-1.0,
+        no_speech_threshold=0.6,
+    )
+    data = {
+        "language": info.language,
+        "language_probability": info.language_probability,
+        "segments": [
+            {
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text,
+                "avg_logprob": segment.avg_logprob,
+                "no_speech_prob": segment.no_speech_prob,
+                "compression_ratio": segment.compression_ratio,
+                "speaker": None,
+            }
+            for segment in segments
+        ],
+    }
+    output_file = output_dir / f"{Path(audio_path).stem}.json"
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return data
+
+
+def run_whisper(audio_path, output_dir, language, backend):
+    if backend == "faster-whisper":
+        return faster_whisper_transcribe(audio_path, output_dir, language)
+
     if not HF_TOKEN:
         raise RuntimeError("HF_TOKEN environment variable is not set")
 
@@ -296,10 +348,16 @@ INDEX_HTML = """
   </style>
 </head>
 <body>
-  <h1>Audio → Diarized Bilingual Transcript</h1>
-  <p>Runs Whisper twice (Romanian + English) with speaker diarization, then merges the results.</p>
+  <h1>Audio → Bilingual Transcript</h1>
+  <p>Runs the selected backend twice (Romanian + English) and merges the results. Speaker diarization is available with whispermlx.</p>
   <form id="f">
     <input type="file" name="audio" accept="audio/*,.m4a" required>
+    <br>
+    <label for="backend">Transcription backend:</label>
+    <select name="backend" id="backend">
+      <option value="whispermlx" {% if default_backend == "whispermlx" %}selected{% endif %}>whispermlx (speaker diarization)</option>
+      <option value="faster-whisper" {% if default_backend == "faster-whisper" %}selected{% endif %}>Faster Whisper (no speaker diarization)</option>
+    </select>
     <br>
     <button type="submit">Transcribe</button>
   </form>
@@ -318,7 +376,7 @@ INDEX_HTML = """
         const r = await fetch('/transcribe', { method: 'POST', body: fd });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-        status.textContent = 'Done. Merged file: ' + j.merged_file +
+        status.textContent = 'Done with ' + j.backend + '. Merged file: ' + j.merged_file +
           (j.deduped_count ? ' (deduped ' + j.deduped_count + ' EN segment(s))' : '');
         result.textContent = JSON.stringify(j.result, null, 2);
         result.style.display = 'block';
@@ -334,7 +392,7 @@ INDEX_HTML = """
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(INDEX_HTML)
+    return render_template_string(INDEX_HTML, default_backend=DEFAULT_BACKEND)
 
 
 @app.route("/health", methods=["GET"])
@@ -344,6 +402,8 @@ def health():
         "hf_token_set": bool(HF_TOKEN),
         "device": DEVICE,
         "model": MODEL,
+        "default_backend": DEFAULT_BACKEND,
+        "backends": BACKENDS,
         "transcriptions_dir": str(TRANSCRIPTIONS_DIR),
         "dedup_sim_threshold": SIM_THRESHOLD,
     })
@@ -358,6 +418,10 @@ def transcribe():
     if not upload.filename:
         return jsonify({"error": "empty filename"}), 400
 
+    backend = request.form.get("backend", DEFAULT_BACKEND).strip().lower()
+    if backend not in BACKENDS:
+        return jsonify({"error": f"backend must be one of: {', '.join(BACKENDS)}"}), 400
+
     basename = Path(upload.filename).name
     stem = re.sub(r"\.m4a$", "", basename, flags=re.IGNORECASE)
     stem = Path(stem).stem or f"upload_{uuid.uuid4().hex[:8]}"
@@ -367,8 +431,8 @@ def transcribe():
     upload.save(audio_path)
 
     try:
-        run_whisper(audio_path, RO_DIR, "ro")
-        run_whisper(audio_path, EN_DIR, "en")
+        run_whisper(audio_path, RO_DIR, "ro", backend)
+        run_whisper(audio_path, EN_DIR, "en", backend)
 
         ro_file = RO_DIR / f"{stem}.json"
         en_file = EN_DIR / f"{stem}.json"
@@ -390,6 +454,7 @@ def transcribe():
             json.dump(result, f, indent=2, ensure_ascii=False)
 
         return jsonify({
+            "backend": backend,
             "ro_file": str(ro_file),
             "en_file": str(en_file),
             "merged_file": str(merged_file),
