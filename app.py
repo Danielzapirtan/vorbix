@@ -4,6 +4,8 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 from functools import lru_cache
 from difflib import SequenceMatcher
@@ -32,6 +34,45 @@ RO_DIR = TRANSCRIPTIONS_DIR / "ro"
 EN_DIR = TRANSCRIPTIONS_DIR / "en"
 RO_DIR.mkdir(parents=True, exist_ok=True)
 EN_DIR.mkdir(parents=True, exist_ok=True)
+
+_PROGRESS_LOCK = threading.Lock()
+_TRANSCRIPTION_PROGRESS = {}
+_PROGRESS_TTL_SECONDS = 3600
+
+
+def _set_transcription_progress(progress_id, percentage, message, state="working"):
+    if not progress_id:
+        return
+    now = time.monotonic()
+    with _PROGRESS_LOCK:
+        expired = [
+            key for key, value in _TRANSCRIPTION_PROGRESS.items()
+            if now - value["updated_at"] > _PROGRESS_TTL_SECONDS
+        ]
+        for key in expired:
+            del _TRANSCRIPTION_PROGRESS[key]
+        _TRANSCRIPTION_PROGRESS[progress_id] = {
+            "percentage": round(max(0, min(100, percentage))),
+            "message": message,
+            "state": state,
+            "updated_at": now,
+        }
+
+
+def _get_transcription_progress(progress_id):
+    now = time.monotonic()
+    with _PROGRESS_LOCK:
+        progress = _TRANSCRIPTION_PROGRESS.get(progress_id)
+        if progress and now - progress["updated_at"] > _PROGRESS_TTL_SECONDS:
+            del _TRANSCRIPTION_PROGRESS[progress_id]
+            progress = None
+        if progress:
+            return {
+                "percentage": progress["percentage"],
+                "message": progress["message"],
+                "state": progress["state"],
+            }
+    return None
 
 
 # ---- Merging logic (ported from the heredoc Python block) ----
@@ -270,7 +311,7 @@ def get_faster_whisper_model(model_name, device):
     return WhisperModel(model_name, device=device, compute_type="default")
 
 
-def faster_whisper_transcribe(audio_path, output_dir, language):
+def faster_whisper_transcribe(audio_path, output_dir, language, progress_callback=None):
     model = get_faster_whisper_model(MODEL, DEVICE)
     segments, info = model.transcribe(
         str(audio_path),
@@ -281,21 +322,27 @@ def faster_whisper_transcribe(audio_path, output_dir, language):
         log_prob_threshold=-1.0,
         no_speech_threshold=0.6,
     )
+    output_segments = []
+    duration = getattr(info, "duration", 0)
+    for segment in segments:
+        output_segments.append({
+            "start": segment.start,
+            "end": segment.end,
+            "text": segment.text,
+            "avg_logprob": segment.avg_logprob,
+            "no_speech_prob": segment.no_speech_prob,
+            "compression_ratio": segment.compression_ratio,
+            "speaker": None,
+        })
+        if progress_callback and duration and duration > 0:
+            progress_callback(segment.end / duration)
+    if progress_callback:
+        progress_callback(1)
+
     data = {
         "language": info.language,
         "language_probability": info.language_probability,
-        "segments": [
-            {
-                "start": segment.start,
-                "end": segment.end,
-                "text": segment.text,
-                "avg_logprob": segment.avg_logprob,
-                "no_speech_prob": segment.no_speech_prob,
-                "compression_ratio": segment.compression_ratio,
-                "speaker": None,
-            }
-            for segment in segments
-        ],
+        "segments": output_segments,
     }
     output_file = output_dir / f"{Path(audio_path).stem}.json"
     with open(output_file, "w", encoding="utf-8") as f:
@@ -303,9 +350,11 @@ def faster_whisper_transcribe(audio_path, output_dir, language):
     return data
 
 
-def run_whisper(audio_path, output_dir, language, backend):
+def run_whisper(audio_path, output_dir, language, backend, progress_callback=None):
     if backend == "faster-whisper":
-        return faster_whisper_transcribe(audio_path, output_dir, language)
+        return faster_whisper_transcribe(
+            audio_path, output_dir, language, progress_callback=progress_callback
+        )
 
     if not HF_TOKEN:
         raise RuntimeError("HF_TOKEN environment variable is not set")
@@ -492,6 +541,30 @@ INDEX_HTML = """
     .status.visible { display: block; }
     .status[data-state="error"] { border-color: #f3d0d0; background: #fff8f8; color: #a13232; }
     .status[data-state="success"] { border-color: #ccebd9; background: #f5fcf7; color: #236741; }
+    .progress[hidden] { display: none; }
+    .progress {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+      padding: 13px 17px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: #fff;
+    }
+    .progress-label { color: #46566c; font-size: 12px; }
+    .progress-track {
+      height: 9px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e9eef7;
+    }
+    .progress-value {
+      width: 0;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--blue);
+      transition: width .25s ease;
+    }
     .result-wrap {
       margin-top: 18px;
       overflow: hidden;
@@ -556,6 +629,13 @@ INDEX_HTML = """
       </form>
     </section>
     <div class="status" id="status" role="status" aria-live="polite"></div>
+    <div class="progress" id="progress" hidden>
+      <div class="progress-label" id="progress-label">Preparing transcription…</div>
+      <div class="progress-track" role="progressbar" aria-label="Transcription progress"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="progress-value" id="progress-value"></div>
+      </div>
+    </div>
     <section class="result-wrap" id="result-wrap" aria-label="Transcription result" hidden>
       <h2 class="result-heading">Merged transcript · JSON</h2>
       <pre id="result"></pre>
@@ -565,6 +645,34 @@ INDEX_HTML = """
   <script>
     const f = document.getElementById('f');
     const button = document.getElementById('submit-button');
+    const backend = document.getElementById('backend');
+    const progress = document.getElementById('progress');
+    const progressLabel = document.getElementById('progress-label');
+    const progressTrack = progress.querySelector('[role="progressbar"]');
+    const progressValue = document.getElementById('progress-value');
+
+    async function watchProgress(progressId, shouldStop) {
+      while (!shouldStop()) {
+        try {
+          const response = await fetch('/progress/' + encodeURIComponent(progressId));
+          if (response.ok) {
+            const update = await response.json();
+            if (shouldStop()) return;
+            progressLabel.textContent = update.message;
+            progressTrack.setAttribute('aria-valuenow', update.percentage);
+            progressValue.style.width = update.percentage + '%';
+            if (update.state !== 'working') return;
+          } else if (response.status !== 404) {
+            throw new Error('HTTP ' + response.status);
+          }
+        } catch (err) {
+          if (!shouldStop()) progressLabel.textContent = 'Unable to retrieve transcription progress.';
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
       const status = document.getElementById('status');
@@ -576,10 +684,22 @@ INDEX_HTML = """
       status.textContent = 'Uploading audio and transcribing both language passes. This may take a few minutes…';
       button.disabled = true;
       const fd = new FormData(f);
+      let stopProgress = false;
+      const showProgress = backend.value === 'faster-whisper';
+      progress.hidden = !showProgress;
+      if (showProgress) {
+        const progressId = crypto.randomUUID();
+        fd.append('progress_id', progressId);
+        progressLabel.textContent = 'Preparing transcription…';
+        progressTrack.setAttribute('aria-valuenow', '0');
+        progressValue.style.width = '0%';
+        watchProgress(progressId, () => stopProgress);
+      }
       try {
         const r = await fetch('/transcribe', { method: 'POST', body: fd });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+        stopProgress = true;
         status.dataset.state = 'success';
         status.textContent = 'Transcription complete with ' + j.backend + '. ' + j.segment_count +
           ' segments saved to ' + j.merged_file +
@@ -587,9 +707,12 @@ INDEX_HTML = """
         result.textContent = JSON.stringify(j.result, null, 2);
         resultWrap.hidden = false;
       } catch (err) {
+        stopProgress = true;
         status.dataset.state = 'error';
         status.textContent = 'Error: ' + err.message;
       } finally {
+        stopProgress = true;
+        progress.hidden = true;
         button.disabled = false;
       }
     });
@@ -618,6 +741,18 @@ def health():
     })
 
 
+@app.route("/progress/<progress_id>", methods=["GET"])
+def transcription_progress(progress_id):
+    try:
+        progress_id = str(uuid.UUID(progress_id))
+    except ValueError:
+        return jsonify({"error": "invalid progress id"}), 400
+    progress = _get_transcription_progress(progress_id)
+    if progress is None:
+        return jsonify({"error": "progress not found"}), 404
+    return jsonify(progress)
+
+
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
     if "audio" not in request.files:
@@ -631,6 +766,16 @@ def transcribe():
     if backend not in BACKENDS:
         return jsonify({"error": f"backend must be one of: {', '.join(BACKENDS)}"}), 400
 
+    progress_id = None
+    if backend == "faster-whisper":
+        requested_progress_id = request.form.get("progress_id")
+        if requested_progress_id:
+            try:
+                progress_id = str(uuid.UUID(requested_progress_id))
+            except ValueError:
+                return jsonify({"error": "invalid progress id"}), 400
+            _set_transcription_progress(progress_id, 0, "Preparing transcription…")
+
     basename = Path(upload.filename).name
     stem = re.sub(r"\.m4a$", "", basename, flags=re.IGNORECASE)
     stem = Path(stem).stem or f"upload_{uuid.uuid4().hex[:8]}"
@@ -640,8 +785,31 @@ def transcribe():
     upload.save(audio_path)
 
     try:
-        run_whisper(audio_path, RO_DIR, "ro", backend)
-        run_whisper(audio_path, EN_DIR, "en", backend)
+        for language, output_dir, start_percentage in (
+            ("ro", RO_DIR, 0),
+            ("en", EN_DIR, 50),
+        ):
+            language_name = "Romanian" if language == "ro" else "English"
+            if progress_id:
+                _set_transcription_progress(
+                    progress_id, start_percentage, f"Transcribing {language_name} pass…"
+                )
+
+            def report_pass_progress(ratio):
+                if progress_id:
+                    _set_transcription_progress(
+                        progress_id,
+                        start_percentage + max(0, min(1, ratio)) * 45,
+                        f"Transcribing {language_name} pass…",
+                    )
+
+            if progress_id:
+                run_whisper(
+                    audio_path, output_dir, language, backend,
+                    progress_callback=report_pass_progress,
+                )
+            else:
+                run_whisper(audio_path, output_dir, language, backend)
 
         ro_file = RO_DIR / f"{stem}.json"
         en_file = EN_DIR / f"{stem}.json"
@@ -662,6 +830,8 @@ def transcribe():
         with open(merged_file, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
 
+        if progress_id:
+            _set_transcription_progress(progress_id, 100, "Transcription complete.", "completed")
         return jsonify({
             "backend": backend,
             "ro_file": str(ro_file),
@@ -673,6 +843,8 @@ def transcribe():
         })
 
     except Exception as e:
+        if progress_id:
+            _set_transcription_progress(progress_id, 0, str(e), "error")
         return jsonify({"error": str(e)}), 500
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

@@ -19,8 +19,9 @@ python app.py
 Open `http://localhost:5002`, upload an audio file, and select **Faster
 Whisper**. The model is selected with `WHISPER_MODEL` (default: `large-v3`),
 and Faster Whisper uses `WHISPER_DEVICE` (default: `cpu`; use `cuda` for a
-supported NVIDIA setup). Set `WHISPER_BACKEND=faster-whisper` to make it the
-default selection in the form.
+supported NVIDIA setup). A live progress bar is shown while Faster Whisper
+transcribes the Romanian and English passes. Set
+`WHISPER_BACKEND=faster-whisper` to make it the default selection in the form.
 
 `HF_TOKEN` is required for whispermlx's speaker diarization. It is not required
 for Faster Whisper with public models.
